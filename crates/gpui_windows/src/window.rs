@@ -85,6 +85,8 @@ pub struct WindowsWindowState {
     pub invalidate_devices: Arc<AtomicBool>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
+    pub(crate) gpu_device_state: Rc<Cell<GpuDeviceState>>,
+    pub(crate) pending_renderer_size: Cell<Option<Size<DevicePixels>>>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
@@ -113,6 +115,7 @@ impl WindowsWindowState {
     fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
+        gpu_device_state: Rc<Cell<GpuDeviceState>>,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         cursor_visible: Arc<AtomicBool>,
@@ -176,6 +179,8 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
+            gpu_device_state,
+            pending_renderer_size: Cell::new(None),
             force_render_pending: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
@@ -269,6 +274,7 @@ impl WindowsWindowInner {
         let state = WindowsWindowState::new(
             hwnd,
             &context.directx_devices,
+            context.gpu_device_state.clone(),
             cs,
             context.current_cursor,
             context.cursor_visible.clone(),
@@ -426,6 +432,7 @@ struct WindowCreateContext {
     appearance: WindowAppearance,
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
+    gpu_device_state: Rc<Cell<GpuDeviceState>>,
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
@@ -454,6 +461,7 @@ impl WindowsWindow {
             platform_window_handle,
             disable_direct_composition,
             directx_devices,
+            gpu_device_state,
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
@@ -534,6 +542,7 @@ impl WindowsWindow {
             cursor_visible,
             drop_target_helper,
             validation_number,
+            gpu_device_state,
             main_receiver,
             platform_window_handle,
             appearance,
@@ -649,6 +658,9 @@ impl PlatformWindow for WindowsWindow {
         self.state.content_size()
     }
 
+    fn gpu_device_state(&self) -> GpuDeviceState {
+        self.state.gpu_device_state.get()
+    }
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
@@ -1027,6 +1039,12 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        if !matches!(
+            self.state.gpu_device_state.get(),
+            GpuDeviceState::Ready { .. }
+        ) {
+            return;
+        }
         self.state
             .renderer
             .borrow_mut()
@@ -1036,6 +1054,13 @@ impl PlatformWindow for WindowsWindow {
 
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        anyhow::ensure!(
+            matches!(
+                self.state.gpu_device_state.get(),
+                GpuDeviceState::Ready { .. }
+            ),
+            "render_to_image unavailable while the shared GPU device is not ready"
+        );
         self.state
             .renderer
             .borrow_mut()

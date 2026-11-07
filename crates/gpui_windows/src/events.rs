@@ -29,6 +29,8 @@ pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
 pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
+pub(crate) const WM_GPUI_GPU_DEVICE_RECOVERY_FINISHED: u32 = WM_USER + 10;
+pub(crate) const WM_GPUI_GPU_DEVICE_RECOVERY_FAILED: u32 = WM_USER + 11;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -162,6 +164,7 @@ impl WindowsWindowInner {
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            WM_GPUI_GPU_DEVICE_RECOVERY_FAILED => self.handle_device_recovery_failed(wparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
@@ -278,13 +281,20 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-        {
-            log::error!("Failed to resize renderer, invalidating devices: {}", e);
-            self.state
-                .invalidate_devices
-                .store(true, std::sync::atomic::Ordering::Release);
+        if should_resize_renderer {
+            if matches!(
+                self.state.gpu_device_state.get(),
+                GpuDeviceState::Ready { .. }
+            ) {
+                if let Err(error) = self.state.renderer.borrow_mut().resize(device_size) {
+                    log::error!("Failed to resize renderer, invalidating devices: {error}");
+                    self.state
+                        .invalidate_devices
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            } else {
+                self.state.pending_renderer_size.set(Some(device_size));
+            }
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -1302,16 +1312,27 @@ impl WindowsWindowInner {
     }
 
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+        if lparam.0 == 0 {
+            log::error!("Window received GPU renderer recovery without replacement devices");
+            self.state.renderer.borrow_mut().mark_unavailable();
+            self.state.force_render_pending.set(true);
+            return Some(1);
+        }
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
-        if let Err(err) = self
+        let pending_size = self.state.pending_renderer_size.get();
+        let result = self
             .state
             .renderer
             .borrow_mut()
-            .handle_device_lost(&devices)
-        {
-            panic!("Device lost: {err}");
+            .handle_device_lost(devices, pending_size);
+        if let Err(error) = result {
+            log::error!("Window renderer recovery failed: {error:#}");
+            self.state.renderer.borrow_mut().mark_unavailable();
+            self.state.force_render_pending.set(true);
+            return Some(1);
         }
+        self.state.pending_renderer_size.set(None);
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
         // between) is treated as a forced render so it both clears
@@ -1320,13 +1341,34 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    fn handle_device_recovery_failed(&self, wparam: WPARAM) -> Option<isize> {
+        if wparam.0 != self.validation_number {
+            log::error!("Wrong validation number while processing GPU recovery failure");
+            return Some(0);
+        }
+        self.state.renderer.borrow_mut().mark_unavailable();
+        self.state.force_render_pending.set(true);
+        Some(0)
+    }
+
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
         None
     }
+    fn validate_window_region(&self, handle: HWND) {
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+    }
 
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
+        if !matches!(
+            self.state.gpu_device_state.get(),
+            GpuDeviceState::Ready { .. }
+        ) {
+            self.state.force_render_pending.set(true);
+            self.validate_window_region(handle);
+            return Some(0);
+        }
         let Some(_guard) = self.state.draw_coordinator.try_begin_draw() else {
             log::debug!("deferring re-entrant draw of window {handle:?}");
             if force_render {
@@ -1338,7 +1380,7 @@ impl WindowsWindowInner {
             // re-invalidates every window on each vsync (see
             // `begin_vsync_thread`), so the deferred frame still gets drawn,
             // at most one vsync late.
-            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            self.validate_window_region(handle);
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
@@ -1368,7 +1410,7 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+        self.validate_window_region(handle);
 
         Some(0)
     }

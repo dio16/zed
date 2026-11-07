@@ -37,6 +37,8 @@ pub use test_context::*;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test_context::*;
 
+#[cfg(feature = "test-support")]
+use crate::GpuDeviceRecoveryTest;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
 use crate::asset_cache::CachedLoad;
@@ -44,10 +46,10 @@ use crate::{
     Action, ActionBuildError, ActionRegistry, ActivityGuard, Any, AnyView, AnyWindowHandle,
     AppContext, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem,
     ClipboardReadError, CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload,
-    FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke,
-    LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
-    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    FocusHandle, FocusMap, ForegroundExecutor, Global, GpuDeviceState, KeyBinding, KeyContext,
+    Keymap, Keystroke, LayoutId, Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions,
+    Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point,
+    Priority, PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
     RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
     Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
     TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
@@ -744,6 +746,7 @@ enum PlatformOwnedDragState {
 pub struct App {
     pub(crate) this: Weak<AppCell>,
     pub(crate) platform: Rc<dyn Platform>,
+    gpu_device_state: GpuDeviceState,
     text_system: Arc<TextSystem>,
 
     pub(crate) actions: Rc<ActionRegistry>,
@@ -772,6 +775,7 @@ pub struct App {
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     missing_glyph_callback: Rc<MissingGlyphCallbackSlot>,
     pub(crate) thermal_state_observers: SubscriberSet<(), Handler>,
+    pub(crate) gpu_device_state_observers: SubscriberSet<(), Handler>,
     pub(crate) system_sleep_observers: SubscriberSet<(), Handler>,
     pub(crate) system_wake_observers: SubscriberSet<(), Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
@@ -867,6 +871,7 @@ impl App {
             app: RefCell::new(App {
                 this: this.clone(),
                 platform: platform.clone(),
+                gpu_device_state: platform.gpu_device_state(),
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 mode: GpuiMode::Production,
@@ -908,6 +913,7 @@ impl App {
                 keyboard_layout_observers: SubscriberSet::new(),
                 missing_glyph_callback: Rc::default(),
                 thermal_state_observers: SubscriberSet::new(),
+                gpu_device_state_observers: SubscriberSet::new(),
                 system_sleep_observers: SubscriberSet::new(),
                 system_wake_observers: SubscriberSet::new(),
                 global_observers: SubscriberSet::new(),
@@ -968,6 +974,50 @@ impl App {
                         .clone()
                         .retain(&(), move |callback| (callback)(cx));
                 }
+            }
+        }));
+        platform.on_gpu_device_state_change(Box::new({
+            let foreground_executor = app.borrow().foreground_executor.clone();
+            let app = Rc::downgrade(&app);
+            move |state, after_observers| {
+                let app = app.clone();
+                let executor = foreground_executor.clone();
+                let idle_executor = executor.clone();
+                executor
+                    .spawn(async move {
+                        let foreground_executor = idle_executor;
+                        let mut after_observers = after_observers;
+                        loop {
+                            let Some(app) = app.upgrade() else {
+                                if let Some(after_observers) = after_observers.take() {
+                                    after_observers();
+                                }
+                                return;
+                            };
+                            match app.try_borrow_mut() {
+                                Ok(mut cx) => {
+                                    cx.gpu_device_state = state;
+                                    cx.gpu_device_state_observers
+                                        .clone()
+                                        .retain(&(), |callback| (callback)(&mut *cx));
+                                    drop(cx);
+                                    if let Some(after_observers) = after_observers.take() {
+                                        after_observers();
+                                    }
+                                    return;
+                                }
+                                Err(_) => {
+                                    foreground_executor
+                                        .spawn_when_idle(
+                                            Some(std::time::Duration::from_millis(50)),
+                                            async {},
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    })
+                    .detach();
             }
         }));
 
@@ -1432,6 +1482,42 @@ impl App {
     /// Returns the current thermal state of the system.
     pub fn thermal_state(&self) -> ThermalState {
         self.platform.thermal_state()
+    }
+    /// Returns the current shared GPU-device state and resource generation.
+    ///
+    /// A `Ready` state does not imply that drawing, transfer, or presentation
+    /// has completed.
+    pub fn gpu_device_state(&self) -> GpuDeviceState {
+        self.gpu_device_state
+    }
+
+    /// Invokes a handler when the shared GPU-device state changes.
+    ///
+    /// The notification runs on the main thread after the platform has
+    /// published the new state. The `Recovering` notification is delivered
+    /// before device-dependent resources are torn down.
+    pub fn on_gpu_device_state_change<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let (subscription, activate) = self.gpu_device_state_observers.insert(
+            (),
+            Box::new(move |cx| {
+                callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Requests the Windows GPU device-recreation test path.
+    ///
+    /// Returns `false` when test support is unavailable or the platform
+    /// cannot accept the request.
+    #[cfg(feature = "test-support")]
+    pub fn request_gpu_device_recreation(&self, mode: GpuDeviceRecoveryTest) -> bool {
+        self.platform.request_gpu_device_recreation(mode)
     }
 
     /// Prevents idle sleep while the returned guard is held.

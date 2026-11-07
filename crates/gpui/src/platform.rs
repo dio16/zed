@@ -310,6 +310,19 @@ pub trait Platform: 'static {
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
 
+    fn gpu_device_state(&self) -> GpuDeviceState {
+        GpuDeviceState::Unsupported
+    }
+    fn on_gpu_device_state_change(
+        &self,
+        _callback: Box<dyn FnMut(GpuDeviceState, Option<Box<dyn FnOnce()>>)>,
+    ) {
+    }
+    #[cfg(feature = "test-support")]
+    fn request_gpu_device_recreation(&self, _mode: GpuDeviceRecoveryTest) -> bool {
+        false
+    }
+
     fn thermal_state(&self) -> ThermalState;
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>);
     fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>>;
@@ -470,6 +483,32 @@ pub struct SystemNotificationResponse {
     /// The pressed action button's [`SystemNotificationAction::id`], or
     /// `None` when the user activated the notification body itself.
     pub action_id: Option<SharedString>,
+}
+/// The state of the platform's shared GPU device.
+///
+/// A generation identifies a device-resource epoch, not completed GPU work.
+/// In particular, `Ready` does not imply that drawing, transfer, or
+/// presentation has completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuDeviceState {
+    /// This platform does not expose a recoverable GPU device.
+    Unsupported,
+    /// The shared device and its platform resources are ready for drawing.
+    Ready { generation: u64 },
+    /// The shared device is being recreated. Its generation has advanced.
+    Recovering { generation: u64 },
+    /// Device recreation failed; drawing is unavailable until a later attempt.
+    Unavailable { generation: u64 },
+}
+
+/// A feature-gated request for the Windows device-recreation test path.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuDeviceRecoveryTest {
+    /// Recreate the device through the normal recovery route.
+    Recreate,
+    /// Force the device factory stage to fail deterministically.
+    Fail,
 }
 
 /// Thermal state of the system
@@ -901,6 +940,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Do not invoke callbacks here: GPUI is already updating this window.
     fn prepare_frame(&self) -> bool {
         false
+    }
+    fn gpu_device_state(&self) -> GpuDeviceState {
+        GpuDeviceState::Unsupported
     }
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;

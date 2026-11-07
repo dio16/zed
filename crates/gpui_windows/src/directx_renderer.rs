@@ -44,6 +44,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    disable_direct_composition: bool,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -190,6 +191,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            disable_direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -202,15 +204,18 @@ impl DirectXRenderer {
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
-        let resources = self.resources.as_ref().expect("resources missing");
+        let resources = self.resources.as_ref().context("resources missing")?;
         let device_context = &self
             .devices
             .as_ref()
-            .expect("devices missing")
+            .context("devices missing")?
             .device_context;
         update_buffer(
             device_context,
-            self.globals.global_params_buffer.as_ref().unwrap(),
+            self.globals
+                .global_params_buffer
+                .as_ref()
+                .context("global parameter buffer missing")?,
             &[GlobalParams {
                 gamma_ratios: self.font_info.gamma_ratios,
                 viewport_size: [resources.viewport.Width, resources.viewport.Height],
@@ -246,14 +251,22 @@ impl DirectXRenderer {
         let result = unsafe {
             self.resources
                 .as_ref()
-                .expect("resources missing")
+                .context("resources missing")?
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
         result.ok().context("Presenting swap chain failed")
     }
 
-    pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+    pub(crate) fn handle_device_lost(
+        &mut self,
+        directx_devices: &DirectXDevices,
+        new_size: Option<Size<DevicePixels>>,
+    ) -> Result<()> {
+        if let Some(new_size) = new_size {
+            self.width = new_size.width.0.max(1) as u32;
+            self.height = new_size.height.0.max(1) as u32;
+        }
         try_to_recover_from_device_lost(|| {
             self.handle_device_lost_impl(directx_devices)
                 .context("DirectXRenderer handling device lost")
@@ -261,7 +274,7 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        let disable_direct_composition = self.disable_direct_composition;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -326,15 +339,20 @@ impl DirectXRenderer {
         self.skip_draws = true;
         Ok(())
     }
+    pub(crate) fn mark_unavailable(&mut self) {
+        self.resources = None;
+        self.direct_composition = None;
+        self.devices = None;
+        self.skip_draws = true;
+    }
 
     pub(crate) fn draw(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        if self.skip_draws {
-            // skip drawing this frame, we just recovered from a device lost event
-            // and so likely do not have the textures anymore that are required for drawing
+        if self.skip_draws || self.resources.is_none() || self.devices.is_none() {
+            // No renderer should issue GPU commands while recovery is pending or unavailable.
             return Ok(());
         }
         self.render(scene, background_appearance)?;
@@ -422,6 +440,10 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
+        anyhow::ensure!(
+            self.resources.is_some() && self.devices.is_some(),
+            "render_to_image unavailable without renderer resources"
+        );
         self.render(scene, background_appearance)?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -485,16 +507,21 @@ impl DirectXRenderer {
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
         let width = new_size.width.0.max(1) as u32;
         let height = new_size.height.0.max(1) as u32;
-        if self.width == width && self.height == height {
+        if self.width == width
+            && self.height == height
+            && self.resources.is_some()
+            && self.devices.is_some()
+        {
             return Ok(());
         }
         self.width = width;
         self.height = height;
 
+        let (Some(devices), Some(resources)) = (&self.devices, &mut self.resources) else {
+            return Ok(());
+        };
         // Clear the render target before resizing
-        let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
-        let resources = self.resources.as_mut().context("resources missing")?;
         resources.render_target.take();
         resources.render_target_view.take();
 

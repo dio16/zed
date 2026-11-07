@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, SyncSender},
     },
 };
 
@@ -81,6 +82,10 @@ pub(crate) struct WindowsPlatformState {
     /// Shared with each window to coordinate draws across windows on the UI
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
+    pub(crate) gpu_device_state: Rc<Cell<GpuDeviceState>>,
+    recovery_start_sender: RefCell<Option<SyncSender<u64>>>,
+    #[cfg(feature = "test-support")]
+    recovery_test_sender: RefCell<Option<SyncSender<GpuDeviceRecoveryTest>>>,
     directx_devices: RefCell<Option<DirectXDevices>>,
 }
 
@@ -94,7 +99,17 @@ struct PlatformCallbacks {
     validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn Action) -> bool>>>,
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_sleep: Cell<Option<Box<dyn FnMut()>>>,
+    gpu_device_state_change:
+        Cell<Option<Box<dyn FnMut(GpuDeviceState, Option<Box<dyn FnOnce()>>)>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryTestMode {
+    None,
+    #[cfg(feature = "test-support")]
+    Recreate,
+    #[cfg(feature = "test-support")]
+    Fail,
 }
 
 impl WindowsPlatformState {
@@ -102,6 +117,11 @@ impl WindowsPlatformState {
         let callbacks = PlatformCallbacks::default();
         let jump_list = JumpList::new();
         let current_cursor = load_cursor(CursorStyle::Arrow);
+        let initial_gpu_device_state = if directx_devices.is_some() {
+            GpuDeviceState::Ready { generation: 1 }
+        } else {
+            GpuDeviceState::Unsupported
+        };
 
         Self {
             callbacks,
@@ -109,8 +129,26 @@ impl WindowsPlatformState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
+            gpu_device_state: Rc::new(Cell::new(initial_gpu_device_state)),
+            recovery_start_sender: RefCell::new(None),
+            #[cfg(feature = "test-support")]
+            recovery_test_sender: RefCell::new(None),
             directx_devices: RefCell::new(directx_devices),
             menus: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn notify_gpu_device_state_change(
+        &self,
+        state: GpuDeviceState,
+        after_observers: Option<Box<dyn FnOnce()>>,
+    ) {
+        let mut callback = self.callbacks.gpu_device_state_change.take();
+        if let Some(mut callback) = callback.take() {
+            callback(state, after_observers);
+            self.callbacks.gpu_device_state_change.set(Some(callback));
+        } else if let Some(after_observers) = after_observers {
+            after_observers();
         }
     }
 }
@@ -285,21 +323,38 @@ impl WindowsPlatform {
             });
     }
 
-    fn generate_creation_info(&self) -> WindowCreationInfo {
-        WindowCreationInfo {
+    fn generate_creation_info(&self) -> Result<WindowCreationInfo> {
+        let gpu_device_state = self.inner.state.gpu_device_state.get();
+        anyhow::ensure!(
+            matches!(gpu_device_state, GpuDeviceState::Ready { .. }),
+            "cannot create a Windows window while the shared GPU device is {gpu_device_state:?}"
+        );
+        let directx_devices = self
+            .inner
+            .state
+            .directx_devices
+            .borrow()
+            .clone()
+            .context("Windows GPU device is unavailable")?;
+        let drop_target_helper = self
+            .drop_target_helper
+            .clone()
+            .context("Windows drag-and-drop helper is unavailable")?;
+        Ok(WindowCreationInfo {
             icon: self.icon,
             executor: self.foreground_executor.clone(),
             current_cursor: self.inner.state.current_cursor.get(),
             cursor_visible: self.inner.state.cursor_visible.clone(),
-            drop_target_helper: self.drop_target_helper.clone().unwrap(),
+            drop_target_helper,
             validation_number: self.inner.validation_number,
             main_receiver: self.inner.main_receiver.clone(),
             platform_window_handle: self.handle,
             disable_direct_composition: self.disable_direct_composition,
-            directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
+            directx_devices,
+            gpu_device_state: self.inner.state.gpu_device_state.clone(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
-        }
+        })
     }
 
     fn set_dock_menus(&self, menus: Vec<MenuItem>) {
@@ -364,13 +419,21 @@ impl WindowsPlatform {
     }
 
     fn begin_vsync_thread(&self) {
-        let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
+        let Some(mut directx_device) = self.inner.state.directx_devices.borrow().clone() else {
             return;
         };
         let Some(direct_write_text_system) = &self.direct_write_text_system else {
             return;
         };
-        let mut directx_device = directx_devices;
+        let (recovery_start_sender, recovery_start_receiver) = mpsc::sync_channel(1);
+        *self.inner.state.recovery_start_sender.borrow_mut() = Some(recovery_start_sender);
+        #[cfg(feature = "test-support")]
+        let (recovery_test_sender, recovery_test_receiver) = mpsc::sync_channel(1);
+        #[cfg(feature = "test-support")]
+        {
+            *self.inner.state.recovery_test_sender.borrow_mut() = Some(recovery_test_sender);
+        }
+
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
@@ -381,27 +444,165 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                let mut device_available = true;
                 loop {
-                    vsync_provider.wait_for_vsync();
-                    if check_device_lost(&directx_device.device)
-                        || invalidate_devices.fetch_and(false, Ordering::Acquire)
-                    {
-                        if let Err(err) = handle_gpu_device_lost(
-                            &mut directx_device,
-                            platform_window.as_raw(),
-                            validation_number,
-                            &all_windows,
-                            &text_system,
-                        ) {
-                            panic!("Device lost: {err}");
+                    #[cfg(feature = "test-support")]
+                    let test_request = if device_available {
+                        recovery_test_receiver.try_recv().ok()
+                    } else {
+                        match recovery_test_receiver.recv() {
+                            Ok(request) => Some(request),
+                            Err(_) => break,
                         }
+                    };
+                    #[cfg(not(feature = "test-support"))]
+                    let test_request: Option<()> = None;
+                    #[cfg(not(feature = "test-support"))]
+                    if !device_available {
+                        break;
                     }
+
+                    if device_available && test_request.is_none() {
+                        vsync_provider.wait_for_vsync();
+                    }
+                    let invalidated =
+                        device_available && invalidate_devices.swap(false, Ordering::AcqRel);
+                    let device_loss_reason = if device_available {
+                        device_removed_reason(&directx_device.device)
+                    } else {
+                        None
+                    };
+                    #[cfg(feature = "test-support")]
+                    let test_mode_requested = test_request.is_some();
+                    #[cfg(not(feature = "test-support"))]
+                    let test_mode_requested = false;
+                    if !invalidated && device_loss_reason.is_none() && !test_mode_requested {
+                        let Some(all_windows) = all_windows.upgrade() else {
+                            break;
+                        };
+                        let windows = all_windows.read().clone();
+                        unsafe {
+                            for hwnd in windows.iter() {
+                                let _ = RedrawWindow(
+                                    Some(hwnd.as_raw()),
+                                    None,
+                                    None,
+                                    RDW_INVALIDATE,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
-                    for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                    #[cfg(feature = "test-support")]
+                    let test_mode = match test_request {
+                        Some(GpuDeviceRecoveryTest::Recreate) => RecoveryTestMode::Recreate,
+                        Some(GpuDeviceRecoveryTest::Fail) => RecoveryTestMode::Fail,
+                        None => RecoveryTestMode::None,
+                    };
+                    #[cfg(not(feature = "test-support"))]
+                    let test_mode = RecoveryTestMode::None;
+
+                    // This message moves the shared snapshot to Recovering and schedules the
+                    // main-thread observers. It is posted (not sent) so the worker does not
+                    // block the UI thread; `recovery_start_receiver` below still prevents any
+                    // device teardown until the observers acknowledged the transition.
+                    unsafe {
+                        if let Err(error) = PostMessageW(
+                            Some(platform_window.as_raw()),
+                            WM_GPUI_GPU_DEVICE_LOST,
+                            WPARAM(validation_number),
+                            LPARAM(0),
+                        ) {
+                            log::error!("Could not start GPU recovery: {error}");
+                            break;
+                        }
+                        let generation = match recovery_start_receiver.recv() {
+                            Ok(generation) => generation,
+                            Err(error) => {
+                                log::error!("GPU recovery start acknowledgement failed: {error}");
+                                break;
+                            }
+                        };
+
+                        if let Some(reason) = &device_loss_reason {
+                            log::error!(
+                                "DXGI reported device removal for generation {generation}: {reason:?}"
+                            );
+                        }
+                        if invalidated {
+                            log::warn!(
+                                "Renderer resize invalidated GPU resources for generation {generation}"
+                            );
+                        }
+                        #[cfg(feature = "test-support")]
+                        if test_mode != RecoveryTestMode::None {
+                            log::info!(
+                                "GPU recovery test request {test_mode:?} for generation {generation}"
+                            );
+                        }
+
+                        let recovery = handle_gpu_device_lost(
+                            &mut directx_device,
+                            validation_number,
+                            &all_windows,
+                            &text_system,
+                            generation,
+                            invalidated,
+                            test_mode,
+                        );
+                        if let Err(error) = &recovery {
+                            log::error!("DirectX device recovery failed: {error:#}");
+                        }
+                        device_available = recovery.is_ok();
+                        let windows = all_windows.read().clone();
+                        if device_available {
+                            let device_ptr = &directx_device as *const DirectXDevices;
+                            let _ = SendMessageW(
+                                platform_window.as_raw(),
+                                WM_GPUI_GPU_DEVICE_RECOVERY_FINISHED,
+                                Some(WPARAM(validation_number)),
+                                Some(LPARAM(device_ptr as isize)),
+                            );
+                            for hwnd in windows.iter() {
+                                let _ = PostMessageW(
+                                    Some(hwnd.as_raw()),
+                                    WM_GPUI_FORCE_UPDATE_WINDOW,
+                                    WPARAM(validation_number),
+                                    LPARAM(0),
+                                );
+                            }
+                        } else {
+                            for hwnd in windows.iter() {
+                                let result = SendMessageW(
+                                    hwnd.as_raw(),
+                                    WM_GPUI_GPU_DEVICE_RECOVERY_FAILED,
+                                    Some(WPARAM(validation_number)),
+                                    Some(LPARAM(0)),
+                                );
+                                if result.0 != 0 {
+                                    log::error!(
+                                        "Window {hwnd:?} did not acknowledge GPU recovery failure"
+                                    );
+                                }
+                            }
+                            let _ = SendMessageW(
+                                platform_window.as_raw(),
+                                WM_GPUI_GPU_DEVICE_RECOVERY_FINISHED,
+                                Some(WPARAM(validation_number)),
+                                Some(LPARAM(0)),
+                            );
+                        }
+                        for hwnd in windows.iter() {
+                            let _ = RedrawWindow(
+                                Some(hwnd.as_raw()),
+                                None,
+                                None,
+                                RDW_INVALIDATE,
+                            );
                         }
                     }
                 }
@@ -492,6 +693,36 @@ impl Platform for WindowsPlatform {
             .set(Some(callback));
     }
 
+    fn gpu_device_state(&self) -> GpuDeviceState {
+        self.inner.state.gpu_device_state.get()
+    }
+
+    fn on_gpu_device_state_change(
+        &self,
+        callback: Box<dyn FnMut(GpuDeviceState, Option<Box<dyn FnOnce()>>)>,
+    ) {
+        self.inner
+            .state
+            .callbacks
+            .gpu_device_state_change
+            .set(Some(callback));
+    }
+
+    #[cfg(feature = "test-support")]
+    fn request_gpu_device_recreation(&self, mode: GpuDeviceRecoveryTest) -> bool {
+        if matches!(
+            self.gpu_device_state(),
+            GpuDeviceState::Unsupported | GpuDeviceState::Recovering { .. }
+        ) {
+            return false;
+        }
+        self.inner
+            .state
+            .recovery_test_sender
+            .borrow()
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(mode).is_ok())
+    }
     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
 
     fn thermal_state(&self) -> ThermalState {
@@ -641,7 +872,7 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
+        let window = WindowsWindow::new(handle, options, self.generate_creation_info()?)?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
 
@@ -1067,6 +1298,7 @@ impl WindowsPlatformInner {
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST
+            | WM_GPUI_GPU_DEVICE_RECOVERY_FINISHED
             | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
             _ => None,
@@ -1092,6 +1324,9 @@ impl WindowsPlatformInner {
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            WM_GPUI_GPU_DEVICE_RECOVERY_FINISHED => {
+                self.handle_gpu_device_recovery_finished(lparam)
+            }
             WM_GPUI_END_SESSION => self.handle_end_session(),
             _ => unreachable!(),
         }
@@ -1237,12 +1472,48 @@ impl WindowsPlatformInner {
         Some(1)
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        let directx_devices = lparam.0 as *const DirectXDevices;
-        let directx_devices = unsafe { &*directx_devices };
-        self.state.directx_devices.borrow_mut().take();
-        *self.state.directx_devices.borrow_mut() = Some(directx_devices.clone());
+    fn handle_device_lost(&self, _lparam: LPARAM) -> Option<isize> {
+        let current = self.state.gpu_device_state.get();
+        let Some(recovering) = next_recovery_state(current) else {
+            log::error!("Ignoring a GPU recovery start while the device state is {current:?}");
+            return Some(0);
+        };
+        self.state.gpu_device_state.set(recovering);
+        let GpuDeviceState::Recovering { generation } = recovering else {
+            return Some(0);
+        };
+        let Some(start_sender) = self.state.recovery_start_sender.borrow().clone() else {
+            let unavailable = GpuDeviceState::Unavailable { generation };
+            self.state.gpu_device_state.set(unavailable);
+            self.state.notify_gpu_device_state_change(unavailable, None);
+            return Some(0);
+        };
+        let after_observers = Box::new(move || {
+            if let Err(error) = start_sender.send(generation) {
+                log::error!("GPU recovery observer acknowledgement was lost: {error}");
+            }
+        });
+        self.state
+            .notify_gpu_device_state_change(recovering, Some(after_observers));
+        Some(0)
+    }
 
+    fn handle_gpu_device_recovery_finished(&self, lparam: LPARAM) -> Option<isize> {
+        let current = self.state.gpu_device_state.get();
+        let recovered = lparam.0 != 0;
+        let Some(next) = finish_recovery_state(current, recovered) else {
+            log::error!("Ignoring an out-of-order GPU recovery completion");
+            return Some(0);
+        };
+        if recovered {
+            let directx_devices = lparam.0 as *const DirectXDevices;
+            let directx_devices = unsafe { &*directx_devices };
+            *self.state.directx_devices.borrow_mut() = Some(directx_devices.clone());
+        } else {
+            self.state.directx_devices.borrow_mut().take();
+        }
+        self.state.gpu_device_state.set(next);
+        self.state.notify_gpu_device_state_change(next, None);
         Some(0)
     }
 }
@@ -1273,6 +1544,7 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) platform_window_handle: HWND,
     pub(crate) disable_direct_composition: bool,
     pub(crate) directx_devices: DirectXDevices,
+    pub(crate) gpu_device_state: Rc<Cell<GpuDeviceState>>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
@@ -1495,69 +1767,151 @@ fn should_auto_hide_scrollbars() -> Result<bool> {
     Ok(ui_settings.AutoHideScrollBars()?)
 }
 
-fn check_device_lost(device: &ID3D11Device) -> bool {
-    let device_state = unsafe { device.GetDeviceRemovedReason() };
-    match device_state {
-        Ok(_) => false,
-        Err(err) => {
-            log::error!("DirectX device lost detected: {:?}", err);
-            true
+fn device_removed_reason(device: &ID3D11Device) -> Option<windows::core::Error> {
+    unsafe { device.GetDeviceRemovedReason() }.err()
+}
+
+fn next_recovery_state(current: GpuDeviceState) -> Option<GpuDeviceState> {
+    let generation = match current {
+        // A generation advances once per recovery attempt; at the saturated maximum
+        // the recovery still proceeds without wrapping the device epoch.
+        GpuDeviceState::Ready { generation } | GpuDeviceState::Unavailable { generation } => {
+            generation.saturating_add(1)
         }
+        // Already recovering: stay in the same epoch instead of advancing twice.
+        GpuDeviceState::Recovering { .. } | GpuDeviceState::Unsupported => return None,
+    };
+    Some(GpuDeviceState::Recovering { generation })
+}
+
+fn finish_recovery_state(current: GpuDeviceState, recovered: bool) -> Option<GpuDeviceState> {
+    let GpuDeviceState::Recovering { generation } = current else {
+        return None;
+    };
+    Some(if recovered {
+        GpuDeviceState::Ready { generation }
+    } else {
+        GpuDeviceState::Unavailable { generation }
+    })
+}
+
+#[cfg(test)]
+mod gpu_device_state_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_advances_from_ready_and_unavailable_only() {
+        assert_eq!(
+            next_recovery_state(GpuDeviceState::Ready { generation: 1 }),
+            Some(GpuDeviceState::Recovering { generation: 2 })
+        );
+        assert_eq!(
+            next_recovery_state(GpuDeviceState::Unavailable { generation: 7 }),
+            Some(GpuDeviceState::Recovering { generation: 8 })
+        );
+        assert_eq!(
+            next_recovery_state(GpuDeviceState::Recovering { generation: 3 }),
+            None
+        );
+        assert_eq!(
+            next_recovery_state(GpuDeviceState::Ready {
+                generation: u64::MAX
+            }),
+            Some(GpuDeviceState::Recovering {
+                generation: u64::MAX
+            })
+        );
+        assert_eq!(next_recovery_state(GpuDeviceState::Unsupported), None);
+    }
+
+    #[test]
+    fn recovery_completion_is_ordered_and_reflects_aggregate_result() {
+        let recovering = GpuDeviceState::Recovering { generation: 4 };
+        assert_eq!(
+            finish_recovery_state(recovering, true),
+            Some(GpuDeviceState::Ready { generation: 4 })
+        );
+        assert_eq!(
+            finish_recovery_state(recovering, false),
+            Some(GpuDeviceState::Unavailable { generation: 4 })
+        );
+        assert_eq!(
+            finish_recovery_state(GpuDeviceState::Ready { generation: 4 }, true),
+            None
+        );
     }
 }
 
 fn handle_gpu_device_lost(
     directx_devices: &mut DirectXDevices,
-    platform_window: HWND,
     validation_number: usize,
-    all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    all_windows: &Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
+    generation: u64,
+    invalidated: bool,
+    test_mode: RecoveryTestMode,
 ) -> Result<()> {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
 
+    #[cfg(feature = "test-support")]
+    let fail_factory = test_mode == RecoveryTestMode::Fail;
+    #[cfg(not(feature = "test-support"))]
+    let fail_factory = false;
     *directx_devices = try_to_recover_from_device_lost(|| {
-        DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
+        if fail_factory {
+            Err(anyhow!(
+                "controlled GPU device factory failure for generation {generation}"
+            ))
+        } else {
+            DirectXDevices::new()
+                .context("Failed to recreate new DirectX devices after device lost")
+        }
     })?;
-    log::info!("DirectX devices successfully recreated.");
+    log::info!("DirectX devices successfully recreated for generation {generation}.");
+    if invalidated {
+        log::debug!("Recovery followed a renderer resize invalidation.");
+    }
+
+    let text_system = text_system
+        .upgrade()
+        .context("DirectWrite text system is unavailable during GPU recovery")?;
+    text_system.handle_gpu_lost(directx_devices)?;
 
     let lparam = LPARAM(directx_devices as *const _ as _);
-    unsafe {
-        SendMessageW(
-            platform_window,
-            WM_GPUI_GPU_DEVICE_LOST,
-            Some(WPARAM(validation_number)),
-            Some(lparam),
-        );
-    }
-
-    if let Some(text_system) = text_system.upgrade() {
-        text_system.handle_gpu_lost(&directx_devices)?;
-    }
-    if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
-            unsafe {
-                SendMessageW(
-                    window.as_raw(),
-                    WM_GPUI_GPU_DEVICE_LOST,
-                    Some(WPARAM(validation_number)),
-                    Some(lparam),
-                );
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
-            unsafe {
-                SendMessageW(
-                    window.as_raw(),
-                    WM_GPUI_FORCE_UPDATE_WINDOW,
-                    Some(WPARAM(validation_number)),
-                    None,
-                );
-            }
+    // Snapshot the handles so the main thread can create or destroy windows while
+    // each renderer recovers inside its own synchronous message.
+    let windows = all_windows.read().clone();
+    let mut window_errors = Vec::new();
+    for window in windows.iter() {
+        let result = unsafe {
+            SendMessageW(
+                window.as_raw(),
+                WM_GPUI_GPU_DEVICE_LOST,
+                Some(WPARAM(validation_number)),
+                Some(lparam),
+            )
+        };
+        if result.0 != 0 {
+            window_errors.push(anyhow!(
+                "window {:?} rejected renderer recovery with {}",
+                window.as_raw(),
+                result.0
+            ));
         }
     }
+    if !window_errors.is_empty() {
+        return Err(anyhow!(
+            "one or more window renderers failed to recover: {}",
+            window_errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
     Ok(())
 }
 
